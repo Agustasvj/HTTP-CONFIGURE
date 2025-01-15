@@ -313,8 +313,15 @@ class FreeInternetApp:
                 self.log(f"Connecting to proxy...")
                 sock.connect((proxy, int(port)))
                 
-                # Get payload from Text widget
-                initial_payload = self.payload_text.get('1.0', tk.END).strip()
+                # Create initial payload
+                initial_payload = (
+                    "GET / HTTP/1.1\r\n"
+                    f"Host: {ssh_host}\r\n"
+                    "Connection: Upgrade\r\n"
+                    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.246\r\n"
+                    "Upgrade: websocket\r\n"
+                    "\r\n"
+                )
                 
                 self.log(f"Sending payload:\n{initial_payload}")
                 sock.send(initial_payload.encode())
@@ -528,16 +535,34 @@ class FreeInternetApp:
             
             if hasattr(self, 'tunnel_socket'):
                 self.log("Using established tunnel for SSH connection")
+                
+                # Set keepalive options
+                self.tunnel_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                # Set TCP keepalive options if on Windows
+                if hasattr(socket, 'TCP_KEEPIDLE'):
+                    self.tunnel_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                if hasattr(socket, 'TCP_KEEPINTVL'):
+                    self.tunnel_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 60)
+                if hasattr(socket, 'TCP_KEEPCNT'):
+                    self.tunnel_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+
+                # Connect with keepalive settings
                 self.ssh.connect(
                     hostname=ssh_host,
                     username=ssh_user,
                     password=ssh_password,
-                    timeout=10,
-                    sock=self.tunnel_socket
+                    timeout=30,
+                    sock=self.tunnel_socket,
+                    disabled_algorithms={'pubkeys': ['rsa-sha2-256', 'rsa-sha2-512']},
+                    look_for_keys=False,
+                    allow_agent=False
                 )
-                self.log("SSH connection established successfully")
                 
+                # Set SSH keepalive
                 transport = self.ssh.get_transport()
+                transport.set_keepalive(60)
+                
+                self.log("SSH connection established successfully")
                 self.log("Setting up dynamic port forwarding...")
                 
                 try:
@@ -546,12 +571,12 @@ class FreeInternetApp:
                     self.log("Dynamic port forwarding established on port 1080")
                     
                     # Start forwarding thread
-                    forward_thread = threading.Thread(
+                    self.forward_thread = threading.Thread(
                         target=self.handle_forward,
                         args=(transport,),
                         daemon=True
                     )
-                    forward_thread.start()
+                    self.forward_thread.start()
                     
                     # Wait a moment for the forwarding to start
                     time.sleep(2)
@@ -601,24 +626,27 @@ class FreeInternetApp:
                 )
                 thread.start()
             except Exception as e:
-                if transport.is_active():
+                if transport and transport.is_active():
                     self.log(f"Forward handling error: {str(e)}")
                 break
 
     def handle_channel(self, channel):
         """Handle individual channel connections"""
         try:
-            while True:
-                data = channel.recv(1024)
-                if not data:
-                    break
-                # Just keep the channel alive
-                channel.send(data)
-        except Exception:
-            pass
+            while channel and not channel.closed:
+                r, w, e = select.select([channel], [], [], 1)
+                if channel in r:
+                    data = channel.recv(32768)
+                    if not data:
+                        break
+                    channel.send(data)
+        except Exception as e:
+            if channel and not channel.closed:
+                self.log(f"Channel error: {str(e)}")
         finally:
             try:
-                channel.close()
+                if channel:
+                    channel.close()
             except:
                 pass
 
